@@ -349,12 +349,15 @@ func tokenSearchKey(pkg schema.PackageReference, tok string) string {
 	return searchKeyReplacer.Replace(strings.ToLower(mod + name))
 }
 
-// getlessSearchKey is tokenSearchKey with any "get" prefix dropped from the
-// member name, matching data sources that omit it.
+// getlessSearchKey drops the member's "get" prefix when it is followed by an
+// uppercase letter, matching PulumiFunctionTokenToHCL's data source naming.
 func getlessSearchKey(pkg schema.PackageReference, tok string) string {
+	name := strings.Split(tok, ":")[2]
+	if len(name) <= 3 || !strings.HasPrefix(name, "get") || name[3] < 'A' || name[3] > 'Z' {
+		return tokenSearchKey(pkg, tok)
+	}
 	mod := pkg.TokenToModule(tok)
-	name := strings.TrimPrefix(strings.ToLower(strings.Split(tok, ":")[2]), "get")
-	return searchKeyReplacer.Replace(strings.ToLower(mod) + name)
+	return searchKeyReplacer.Replace(strings.ToLower(mod + name[3:]))
 }
 
 func resolvePackage(ctx context.Context, loader schema.ReferenceLoader, descriptor *schema.PackageDescriptor) (schema.PackageReference, error) {

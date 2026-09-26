@@ -379,6 +379,14 @@ func TestResolveFunction(t *testing.T) {
 				"clash:ab:getFoo":  {},
 			},
 		},
+		// A lowercase member suffix is not the `getName` convention used
+		// for data sources, even when its module contains dots.
+		schema.PackageSpec{
+			Name: "lowerget",
+			Functions: map[string]schema.FunctionSpec{
+				"lowerget:helm.sh/v3:getrelease": {},
+			},
+		},
 	)
 
 	ctx := t.Context()
@@ -504,6 +512,18 @@ func TestResolveFunction(t *testing.T) {
 			knownProviders: []string{"kubernetes"},
 			token:          "kubernetes_helm.sh_v3_release",
 			wantToken:      "kubernetes:helm.sh/v3:getRelease",
+		},
+		{
+			name:           "lowercase get prefix stays part of the member name",
+			knownProviders: []string{"lowerget"},
+			token:          "lowerget_helm_sh_v3_getrelease",
+			wantToken:      "lowerget:helm.sh/v3:getrelease",
+		},
+		{
+			name:           "lowercase get prefix cannot be omitted",
+			knownProviders: []string{"lowerget"},
+			token:          "lowerget_helm_sh_v3_release",
+			wantErr:        ErrNotFound,
 		},
 		{
 			name:           "multi-segment module implicit get",
