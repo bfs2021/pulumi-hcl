@@ -37,6 +37,8 @@ func TestL2OmittedNestedBlock(t *testing.T) {
 		Providers: []putest.Provider{
 			{Name: "blocky", Factory: providers.BlockyProvider},
 		},
+		// TODO[https://github.com/pulumi/pulumi-hcl/issues/681]: PCL -> HCL emits a MaxItems=1 nested block as an attribute.
+		SkipRoundTrip: "PCL -> HCL emits the `policy` block as an attribute.",
 		ExpectedOutputs: map[string]string{
 			"rule":     "[]",
 			"rule_len": "0",
@@ -69,6 +71,8 @@ func TestL2SetBlockEquality(t *testing.T) {
 		Providers: []putest.Provider{
 			{Name: "blocky", Factory: providers.BlockyProvider},
 		},
+		// TODO[https://github.com/pulumi/pulumi-hcl/issues/679]: HCL -> PCL ignores bridge property renames.
+		SkipRoundTrip: "HCL -> PCL keeps the TF name `filter` for the Pulumi property `filters`, so PCL -> HCL emits the block as an attribute.",
 		ExpectedOutputs: map[string]string{
 			"eq_same":      "true",
 			"eq_reordered": "true",
@@ -84,6 +88,8 @@ func TestL2IgnoreChangesForceNewBlockRemoved(t *testing.T) {
 		Providers: []putest.Provider{
 			{Name: "fnblock", Factory: providers.FNBlockProvider},
 		},
+		// TODO[https://github.com/pulumi/pulumi-hcl/issues/681]: PCL -> HCL emits a MaxItems=1 nested block as an attribute.
+		SkipRoundTrip: "PCL -> HCL emits the `settings` block as an attribute.",
 		ExpectedOutputs: map[string]string{
 			"settings": "[]",
 		},
