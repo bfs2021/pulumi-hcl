@@ -580,7 +580,8 @@ func TestResolveFunction(t *testing.T) {
 }
 
 // TestCanonicalHCLNameRoundtrip checks that the HCL name generated for a token
-// resolves back to that token, including for modules containing dots.
+// resolves back to that token, including for modules with runes that an HCL
+// identifier cannot contain.
 func TestCanonicalHCLNameRoundtrip(t *testing.T) {
 	t.Parallel()
 
@@ -610,6 +611,18 @@ func TestCanonicalHCLNameRoundtrip(t *testing.T) {
 				"grafana:onCall/getTeam:getTeam": {},
 			},
 		},
+		// "-" is valid in an HCL identifier, so it stays. The "_" that
+		// camelToSnake adds after "." joins the "_" that replaces the ".".
+		schema.PackageSpec{
+			Name: "odd",
+			Resources: map[string]schema.ResourceSpec{
+				"odd:my-mod/v1:Thing": {},
+				"odd:web.Api/v2:App":  {},
+			},
+			Functions: map[string]schema.FunctionSpec{
+				"odd:my-mod/v1:getThing": {},
+			},
+		},
 	)
 
 	tests := []struct {
@@ -625,6 +638,9 @@ func TestCanonicalHCLNameRoundtrip(t *testing.T) {
 		{"kubernetes:helm.sh/v3:getRelease", true, "kubernetes_helm_sh_v3_release"},
 		{"grafana:onCall/team:Team", false, "grafana_on_call_team"},
 		{"grafana:onCall/getTeam:getTeam", true, "grafana_on_call_team"},
+		{"odd:my-mod/v1:Thing", false, "odd_my-mod_v1_thing"},
+		{"odd:my-mod/v1:getThing", true, "odd_my-mod_v1_thing"},
+		{"odd:web.Api/v2:App", false, "odd_web_api_v2_app"},
 	}
 
 	for _, tt := range tests {

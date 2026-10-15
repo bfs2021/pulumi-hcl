@@ -18,6 +18,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/pulumi/pulumi-hcl/pkg/hcl/parser"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
 )
 
@@ -25,16 +26,15 @@ import (
 // user's input before we stay silent rather than emit a misleading hint.
 const suggestEditDistanceThreshold = 3
 
-// moduleSeparatorReplacer maps the module separators that an HCL identifier
-// cannot contain to "_".
-var moduleSeparatorReplacer = strings.NewReplacer("/", "_", ".", "_")
-
 func nearestHCLToken(pkg schema.PackageReference, hclToken string, isFunction bool) string {
 	bestDist := suggestEditDistanceThreshold + 1
 	var best string
-	// Candidates never contain ".", so compare a dotted label by its
-	// underscore spelling; otherwise every "." counts as an edit.
-	hclToken = strings.ReplaceAll(hclToken, ".", "_")
+	// Candidates are valid identifiers, so compare a label such as
+	// "kubernetes_helm.sh_v3_release" by its valid spelling; otherwise every
+	// "." counts as an edit.
+	if id, err := parser.MakeValidIdentifier(hclToken); err == nil {
+		hclToken = id
+	}
 	visit := func(tok string) {
 		candidate := pulumiTokenToHCLForm(pkg, tok, isFunction)
 		if candidate == "" {
@@ -82,29 +82,27 @@ func pulumiTokenToHCLForm(pkg schema.PackageReference, token string, isFunction 
 	b.WriteString(pkgName)
 	if mod != "" && mod != "index" {
 		b.WriteRune('_')
-		b.WriteString(strings.ToLower(moduleSeparatorReplacer.Replace(mod)))
+		b.WriteString(strings.ToLower(mod))
 	}
 	b.WriteRune('_')
 	b.WriteString(camelToSnake(name))
-	return b.String()
+	id, err := parser.MakeValidIdentifier(b.String())
+	if err != nil {
+		return ""
+	}
+	return id
 }
 
-// camelToSnake converts a camelCase token segment to snake_case. "/" and "."
-// both become "_", since an HCL identifier cannot contain either.
+// camelToSnake converts a camelCase token segment to snake_case. It keeps
+// runes that an HCL identifier cannot contain; parser.MakeValidIdentifier
+// replaces them and absorbs the "_" added next to them.
 func camelToSnake(s string) string {
 	var b strings.Builder
 	for i, r := range s {
-		if i > 0 && unicode.IsUpper(r) {
-			prev := rune(s[i-1])
-			if prev != '_' && prev != '/' && prev != '.' {
-				b.WriteRune('_')
-			}
-		}
-		if r == '/' || r == '.' {
+		if i > 0 && unicode.IsUpper(r) && s[i-1] != '_' {
 			b.WriteRune('_')
-		} else {
-			b.WriteRune(unicode.ToLower(r))
 		}
+		b.WriteRune(unicode.ToLower(r))
 	}
 	return b.String()
 }

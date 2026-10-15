@@ -25,6 +25,7 @@ import (
 
 	"github.com/blang/semver"
 	"github.com/hashicorp/hcl/v2"
+	"github.com/pulumi/pulumi-hcl/pkg/hcl/parser"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/pcl"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
@@ -111,7 +112,15 @@ func pulumiTokenToHCL(pkg schema.PackageReference, token string, isFunction bool
 	if mod != "index" && mod != "" {
 		hclToken += "_" + camelToSnake(mod)
 	}
-	return hclToken + "_" + camelToSnake(name), nil
+	hclToken, err := parser.MakeValidIdentifier(hclToken + "_" + camelToSnake(name))
+	if err != nil {
+		return "", hcl.Diagnostics{{
+			Severity: hcl.DiagError,
+			Summary:  fmt.Sprintf("Cannot convert %q to an HCL type name", token),
+			Detail:   err.Error(),
+		}}
+	}
+	return hclToken, nil
 }
 
 // PackageFromToken determines the package name from an HCL token and the list of
@@ -314,7 +323,7 @@ func hclSearchKey(pkgName, token string) string {
 	if token != pkgName {
 		token = token[len(pkgName)+1:]
 	}
-	return searchKeyReplacer.Replace(token)
+	return searchKey(token)
 }
 
 // ambiguousMatchError reports an HCL token whose search key matches more than
@@ -331,14 +340,23 @@ func notFoundWithSuggestion(pkg schema.PackageReference, hclToken string, isFunc
 	}
 }
 
-// searchKeyReplacer strips the separators that search keys ignore. "." is
-// among them because an HCL identifier cannot contain one, so a module such as
-// "helm.sh/v3" is written "helm_sh_v3".
-var searchKeyReplacer = strings.NewReplacer("/", "", "_", "", ".", "")
+// searchKey keeps only the runes of s that an HCL identifier can contain,
+// other than "_". parser.MakeValidIdentifier turns every other rune into a
+// "_" or drops it, so a generated HCL name and the token it came from have
+// the same key. A label written with such runes, such as
+// "kubernetes_helm.sh_v3_release", also has the same key.
+func searchKey(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '_' || !parser.IsIdentifierRune(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
 
 // tokenSearchKey produces a normalized lookup key for a Pulumi token by
-// concatenating the schema-declared module and member name and stripping
-// "_", "/" and "." separators after lowercasing. The schema's ModuleFormat
+// concatenating the schema-declared module and member name, lowercasing, and
+// applying searchKey. The schema's ModuleFormat
 // regex (applied by TokenToModule) is responsible for separating the module
 // from the member name and for collapsing the implicit "index" root module to
 // the empty string; bridged-style tokens like "aws:iam/getRole:getRole"
@@ -346,7 +364,7 @@ var searchKeyReplacer = strings.NewReplacer("/", "", "_", "", ".", "")
 func tokenSearchKey(pkg schema.PackageReference, tok string) string {
 	mod := pkg.TokenToModule(tok)
 	name := strings.Split(tok, ":")[2]
-	return searchKeyReplacer.Replace(strings.ToLower(mod + name))
+	return searchKey(strings.ToLower(mod + name))
 }
 
 // getlessSearchKey drops the member's "get" prefix when it is followed by an
@@ -357,7 +375,7 @@ func getlessSearchKey(pkg schema.PackageReference, tok string) string {
 		return tokenSearchKey(pkg, tok)
 	}
 	mod := pkg.TokenToModule(tok)
-	return searchKeyReplacer.Replace(strings.ToLower(mod + name[3:]))
+	return searchKey(strings.ToLower(mod + name[3:]))
 }
 
 func resolvePackage(ctx context.Context, loader schema.ReferenceLoader, descriptor *schema.PackageDescriptor) (schema.PackageReference, error) {
