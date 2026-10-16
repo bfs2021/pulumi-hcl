@@ -17,6 +17,7 @@ package putest_test
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 
@@ -181,5 +182,24 @@ func TestL2NonIdentifierPropertyNames(t *testing.T) {
 		},
 		SkipRoundTrip: "TODO[https://github.com/pulumi/pulumi/issues/23232]: " +
 			"PCL cannot write a property whose name is not an identifier",
+	})
+}
+
+// TestL2NonIdentifierTypeWarning checks that a type label that is not an HCL
+// identifier warns once and names the valid spelling.
+func TestL2NonIdentifierTypeWarning(t *testing.T) {
+	t.Parallel()
+
+	odd := &oddProvider{}
+	putest.RunCase(t, "l2_non_identifier_type_warning", putest.Case{
+		Providers:       []putest.Provider{{Name: "odd", Native: odd.build}},
+		ExpectedOutputs: map[string]string{"value": "ok"},
+		AssertOutput: func(t *testing.T, output string) {
+			assert.Equal(t, 1, strings.Count(diagnosticsSection(t, output),
+				`/main.tf:9,10-32: Type name is not a valid identifier; `+
+					`The resource type "odd_dot.ted_v1_thing" is not a valid identifier, `+
+					`so references to this resource cannot work. Use "odd_dot_ted_v1_thing" instead.`+"\n"))
+		},
+		SkipRoundTrip: "The round trip writes the valid spelling, so the program does not warn.",
 	})
 }
