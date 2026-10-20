@@ -162,8 +162,7 @@ type RegisterResourceRequest struct {
 	Type                    string
 	Name                    string
 	Inputs                  property.Map
-	Dependencies            []string
-	PropertyDependencies    map[string][]string // Map from property key to list of URNs it depends on
+	Dependencies            []urn.URN
 	Custom                  bool
 	Remote                  bool
 	Protect                 bool
@@ -232,7 +231,7 @@ type InvokeRequest struct {
 	Version           string
 	PluginDownloadURL string
 	PackageRef        PackageRef
-	DependsOn         []string
+	DependsOn         []urn.URN
 }
 
 // InvokeResponse contains the result of invoking a function.
@@ -470,7 +469,7 @@ type Engine struct {
 	// with unknowns, so a data source that `depends_on` one of them can defer
 	// its read to apply. An update that leaves every output known does not land
 	// here; catching those needs the engine's diff, not the outputs.
-	pendingURNs *util.SyncMap[string, struct{}]
+	pendingURNs *util.SyncMap[urn.URN, struct{}]
 
 	// pendingModuleCalls holds the cells of the module calls that contain a
 	// pending resource, so `depends_on` naming a module call — which covers
@@ -656,7 +655,7 @@ func NewEngine(ctx context.Context, config *ast.Config, opts *EngineOptions) (*E
 		parallel:                opts.Parallel,
 		expansions:              util.NewSyncMap[expansionCell, *graph.BlockExpansion](),
 		cellURNs:                newURNRegistry(),
-		pendingURNs:             util.NewSyncMap[string, struct{}](),
+		pendingURNs:             util.NewSyncMap[urn.URN, struct{}](),
 		pendingModuleCalls:      util.NewSyncMap[expansionCell, struct{}](),
 		failedNodes:             util.NewSyncMap[graph.InstanceKey, error](),
 		alwaysRegisterProviders: opts.AlwaysRegisterProviders,
@@ -1427,38 +1426,43 @@ func evalSchemaInputs(
 	}
 }
 
-// evalResourceInputs evaluates resource inputs and records property dependencies.
-func evalResourceInputs(
-	hclCtx *hcl.EvalContext,
-	inputProperties []*schema.Property,
-	onEvaluated func(resource.PropertyKey, cty.Value),
-) (transform.EvalFunc, map[string][]string) {
-	plainInputProps := make(map[string]bool, len(inputProperties))
-	for _, p := range inputProperties {
-		plainInputProps[p.Name] = p.Plain
-	}
-
-	dependsOn := make(map[string][]string)
-	record := func(propKey resource.PropertyKey, val cty.Value) {
-		if onEvaluated != nil {
-			onEvaluated(propKey, val)
+// PropertyDependencies returns the dependencies of each value in m that has
+// dependencies, keyed by the path of the value. The dependencies of the ID of
+// a resource reference belong to the path of the reference.
+func PropertyDependencies(m property.Map) map[property.Path][]urn.URN {
+	deps := map[property.Path][]urn.URN{}
+	var walk func(property.Path, property.Value)
+	walk = func(path property.Path, v property.Value) {
+		if d := v.Dependencies(); len(d) > 0 {
+			deps[path] = append(deps[path], d...)
 		}
-
-		prop := string(propKey)
-		if _, ok := dependsOn[prop]; !ok {
-			dependsOn[prop] = nil
-		}
-		if plainInputProps[prop] {
-			return
-		}
-		for _, urn := range eval.CollectDepURNs(val) {
-			idx, found := slices.BinarySearch(dependsOn[prop], urn)
-			if !found {
-				dependsOn[prop] = slices.Insert(dependsOn[prop], idx, urn)
+		switch {
+		case v.IsArray():
+			for i, elem := range v.AsArray().All {
+				walk(path.AppendIndex(i), elem)
 			}
+		case v.IsMap():
+			for k, elem := range v.AsMap().All {
+				walk(path.AppendKey(k), elem)
+			}
+		case v.IsResourceReference():
+			walk(path, v.AsResourceReference().ID)
 		}
 	}
-	return evalSchemaInputs(hclCtx, record), dependsOn
+	for k, v := range m.All {
+		walk(property.Path{}.AppendKey(k), v)
+	}
+	return deps
+}
+
+// allDependencies returns every URN that a value in m depends on, at any depth.
+func allDependencies(m property.Map) []urn.URN {
+	var urns []urn.URN
+	for _, deps := range PropertyDependencies(m) {
+		urns = append(urns, deps...)
+	}
+	slices.Sort(urns)
+	return slices.Compact(urns)
 }
 
 func (e *Engine) registerProviderInContext(
@@ -1487,9 +1491,8 @@ func (e *Engine) registerProviderInContext(
 	}
 
 	providerMapping := e.resolver.ProviderConfigBodyMapping(ctx, pkgName)
-	inputEval, dependsOn := evalResourceInputs(hclCtx, resSchema.InputProperties, nil)
 	inputsMap, _, diags := transform.EvalResourceWithSchema(
-		provider.Config, resSchema, providerMapping, inputEval)
+		provider.Config, resSchema, providerMapping, evalSchemaInputs(hclCtx, nil))
 	if diags.HasErrors() {
 		return fmt.Errorf("evaluating provider %s config: %s", provider.Name, diags.Error())
 	}
@@ -1517,9 +1520,7 @@ func (e *Engine) registerProviderInContext(
 		if vdiags.HasErrors() {
 			return fmt.Errorf("evaluating provider version: %s", vdiags.Error())
 		}
-		if val.Type() == cty.String {
-			version = val.AsString()
-		}
+		version = ctyAsString(val)
 	}
 	if version == "" {
 		version = e.pinnedVersion(provider.Name)
@@ -1566,7 +1567,11 @@ func (e *Engine) registerProviderInContext(
 			// Surface via Inputs so it appears as a top-level output;
 			// the resource-option field (req.PluginDownloadURL) is
 			// set below to the package's schema default.
-			inputs["pluginDownloadURL"] = property.New(val.AsString())
+			pv, err := transform.CtyToPropertyValue(val)
+			if err != nil {
+				return fmt.Errorf("converting plugin_download_url: %w", err)
+			}
+			inputs["pluginDownloadURL"] = pv
 		}
 	}
 
@@ -1575,21 +1580,19 @@ func (e *Engine) registerProviderInContext(
 		if vdiags.HasErrors() {
 			return fmt.Errorf("evaluating additional_secret_outputs: %s", vdiags.Error())
 		}
-		if val.Type().IsTupleType() || val.Type().IsListType() {
+		val, _ = val.UnmarkDeep()
+		if (val.Type().IsTupleType() || val.Type().IsListType()) && val.IsKnown() && !val.IsNull() {
 			for it := val.ElementIterator(); it.Next(); {
 				_, v := it.Element()
-				if v.Type() == cty.String {
-					req.AdditionalSecretOutputs = append(req.AdditionalSecretOutputs, v.AsString())
+				if name := ctyAsString(v); name != "" {
+					req.AdditionalSecretOutputs = append(req.AdditionalSecretOutputs, name)
 				}
 			}
 		}
 	}
 
 	req.Inputs = property.NewMap(inputs)
-	req.PropertyDependencies = dependsOn
-	for _, deps := range dependsOn {
-		req.Dependencies = append(req.Dependencies, deps...)
-	}
+	req.Dependencies = append(req.Dependencies, allDependencies(req.Inputs)...)
 	req.Dependencies = e.cellURNs.widen(req.Dependencies)
 
 	resp, err := e.resmon.RegisterResource(ctx, req)
@@ -1651,7 +1654,7 @@ func (e *Engine) registerResourceInstanceInContext(
 	evalCtx *eval.Context,
 	parentURN urn.URN,
 	modInst *moduleInstance,
-	metaArgDeps []string,
+	metaArgDeps []urn.URN,
 ) error {
 	evalCtx = evalCtx.WithIteration(instance.Index, instance.EachKey, instance.EachValue)
 
@@ -1665,7 +1668,7 @@ func (e *Engine) registerResourceInstanceInContext(
 	if res.Type == packages.TerraformDataType {
 		tdataEvaluated = map[string]cty.Value{}
 	}
-	inputEval, dependsOn := evalResourceInputs(hclCtx, resSchema.InputProperties,
+	inputEval := evalSchemaInputs(hclCtx,
 		func(propKey resource.PropertyKey, val cty.Value) {
 			if tdataEvaluated != nil {
 				tdataEvaluated[string(propKey)] = val
@@ -1679,7 +1682,11 @@ func (e *Engine) registerResourceInstanceInContext(
 	if strings.HasPrefix(res.Type, "pulumi_providers_") && res.PluginDownloadURL != nil {
 		val, valDiags := res.PluginDownloadURL.Value(hclCtx)
 		if !valDiags.HasErrors() && val.Type() == cty.String {
-			resourceInputs = resourceInputs.Set("pluginDownloadURL", property.New(val.AsString()))
+			pv, err := transform.CtyToPropertyValue(val)
+			if err != nil {
+				return fmt.Errorf("converting plugin_download_url: %w", err)
+			}
+			resourceInputs = resourceInputs.Set("pluginDownloadURL", pv)
 		}
 	}
 
@@ -1694,12 +1701,6 @@ func (e *Engine) registerResourceInstanceInContext(
 		}
 		prop := resourceMapping.Lookup("timeouts").PulumiName
 		resourceInputs = resourceInputs.Set(prop, pv)
-		for _, urn := range eval.CollectDepURNs(timeouts) {
-			idx, found := slices.BinarySearch(dependsOn[prop], urn)
-			if !found {
-				dependsOn[prop] = slices.Insert(dependsOn[prop], idx, urn)
-			}
-		}
 	}
 
 	opts, err := e.buildResourceOptions(ctx, node, res, instance, evalCtx, parentURN, modInst, resourceMapping, resSchema.InputProperties, resSchema.Properties, resourceInputs, timeouts)
@@ -1712,7 +1713,6 @@ func (e *Engine) registerResourceInstanceInContext(
 	resourceInputs = wrapTerraformDataInputs(res.Type, resourceInputs, tdataEvaluated)
 	opts.Custom = !resSchema.IsComponent
 	opts.Remote = resSchema.IsComponent
-	opts.PropertyDependencies = dependsOn
 
 	// An ephemeral value is free to differ on every run, so a property it
 	// flows into should not display a diff. The path arrives in the assembled
@@ -1727,13 +1727,11 @@ func (e *Engine) registerResourceInstanceInContext(
 			opts.HideDiffs = append(opts.HideDiffs, glob)
 		}
 	}
-	// The per-source collection may repeat URNs; widen dedups below.
-	for _, deps := range dependsOn {
-		opts.DependsOn = append(opts.DependsOn, deps...)
-	}
+	// The per-property collection may repeat URNs; widen dedups below.
+	opts.DependsOn = append(opts.DependsOn, allDependencies(resourceInputs)...)
 	// count/for_each, lifecycle precondition/postcondition, and
 	// provisioner/connection references are not tied to any body property, so
-	// they stay out of PropertyDependencies but still gate ordering through
+	// they carry no property dependencies but still gate ordering through
 	// DependsOn.
 	checkDeps := checkRuleDeps(res.Preconditions, hclCtx)
 	checkDeps = append(checkDeps, checkRuleDeps(res.Postconditions, hclCtx)...)
@@ -1785,7 +1783,7 @@ func (e *Engine) registerResourceInstanceInContext(
 		return nil
 	}
 
-	e.cellURNs.add(cellKey(node, modInst), string(urn))
+	e.cellURNs.add(cellKey(node, modInst), urn)
 
 	outputs = outputs.Delete("id", "urn")
 
@@ -1825,7 +1823,7 @@ func (e *Engine) registerResourceInstanceInContext(
 	e.resourceOutputs.Set(instance.Key, markedOutputs)
 
 	if !markedOutputs.IsWhollyKnown() {
-		e.pendingURNs.Set(string(urn), struct{}{})
+		e.pendingURNs.Set(urn, struct{}{})
 		for inst := modInst; inst != nil; inst = inst.Parent {
 			e.pendingModuleCalls.Set(moduleCallCell(inst), struct{}{})
 		}
@@ -2170,7 +2168,10 @@ func (e *Engine) buildResourceOptions(
 
 	if key, ok := graph.TraversalKey(node.Key.Module, res.DeletedWith); ok {
 		if outputs, ok := e.nodeOutputs(key); ok {
-			if urn := ctyAsString(outputs.GetAttr("urn")); urn != "" {
+			if urn := urn.URN(ctyAsString(outputs.GetAttr("urn"))); urn != "" {
+				if !urn.IsValid() {
+					return nil, fmt.Errorf("invalid delete_with URN: %q", urn)
+				}
 				opts.DeletedWith = urn
 			}
 		}
@@ -2182,7 +2183,10 @@ func (e *Engine) buildResourceOptions(
 			continue
 		}
 		if outputs, ok := e.nodeOutputs(key); ok {
-			if urn := ctyAsString(outputs.GetAttr("urn")); urn != "" {
+			if urn := urn.URN(ctyAsString(outputs.GetAttr("urn"))); urn != "" {
+				if !urn.IsValid() {
+					return nil, fmt.Errorf("invalid replace_with URN: %q", urn)
+				}
 				opts.ReplaceWith = append(opts.ReplaceWith, urn)
 			}
 		}
@@ -3433,8 +3437,7 @@ func objectProperties(t schema.Type) []*schema.Property {
 type ResourceOptions struct {
 	Custom                  bool
 	Remote                  bool
-	DependsOn               []string
-	PropertyDependencies    map[string][]string
+	DependsOn               []urn.URN
 	Protect                 bool
 	IgnoreChanges           []property.Glob
 	Aliases                 []Alias
@@ -3447,8 +3450,8 @@ type ResourceOptions struct {
 	ImportId                string
 	AdditionalSecretOutputs []string
 	RetainOnDelete          *bool
-	DeletedWith             string          // URN of the resource that, when deleted, causes this resource to be deleted
-	ReplaceWith             []string        // URNs of resources whose replacement triggers replacement of this resource
+	DeletedWith             urn.URN         // URN of the resource that, when deleted, causes this resource to be deleted
+	ReplaceWith             []urn.URN       // URNs of resources whose replacement triggers replacement of this resource
 	HideDiffs               []property.Glob // Property paths whose diffs should not be displayed
 	ReplaceOnChanges        []property.Glob // Property paths that if changed should force a replacement
 	ReplacementTrigger      property.Value  // Value whose change triggers replacement
@@ -3489,7 +3492,6 @@ func (e *Engine) registerResource(
 		Name:                    name,
 		Inputs:                  inputs,
 		Dependencies:            opts.DependsOn,
-		PropertyDependencies:    opts.PropertyDependencies,
 		Custom:                  opts.Custom,
 		Remote:                  opts.Remote,
 		Protect:                 opts.Protect,
@@ -3504,8 +3506,8 @@ func (e *Engine) registerResource(
 		ImportId:                opts.ImportId,
 		AdditionalSecretOutputs: opts.AdditionalSecretOutputs,
 		RetainOnDelete:          opts.RetainOnDelete,
-		DeletedWith:             opts.DeletedWith,
-		ReplaceWith:             opts.ReplaceWith,
+		DeletedWith:             string(opts.DeletedWith),
+		ReplaceWith:             sliceToString(opts.ReplaceWith),
 		HideDiffs:               opts.HideDiffs,
 		ReplaceOnChanges:        opts.ReplaceOnChanges,
 		ReplacementTrigger:      opts.ReplacementTrigger,
@@ -3549,7 +3551,7 @@ func (e *Engine) readResource(
 		ID:                      nameVal.AsString(),
 		Inputs:                  inputs,
 		Parent:                  opts.Parent,
-		Dependencies:            opts.DependsOn,
+		Dependencies:            sliceToString(opts.DependsOn),
 		Provider:                opts.Provider,
 		Version:                 opts.Version,
 		AdditionalSecretOutputs: opts.AdditionalSecretOutputs,
@@ -3585,8 +3587,8 @@ func (e *Engine) invokeDataSourceOnce(
 	}
 
 	depMarks := cty.ValueMarks{}
-	var depURNs []string
-	addURN := func(urn string) {
+	var depURNs []urn.URN
+	addURN := func(urn urn.URN) {
 		if urn == "" {
 			return
 		}
@@ -3936,6 +3938,8 @@ func (e *Engine) processCall(ctx context.Context, node *graph.Node) error {
 	if err != nil {
 		return fmt.Errorf("converting call outputs to HCL types: %w", err)
 	}
+	// The result of a method call depends on its receiver.
+	ctyOutputs = ctyOutputs.Mark(eval.DepMark(urnStr))
 
 	// Store outputs keyed as "resourceName.methodName"
 	callKey := ast.CallKey(call.ResourceName, call.MethodName)
@@ -4385,7 +4389,6 @@ func (e *Engine) initModuleCallIn(
 
 	// Evaluate module inputs for the component resource registration
 	inputs := make(map[string]property.Value)
-	inputDeps := make(map[string][]string)
 	attrs, _ := mod.Config.JustAttributes()
 	for name, attr := range attrs {
 		val, diags := attr.Expr.Value(parentEvalCtx.HCLContext())
@@ -4401,7 +4404,6 @@ func (e *Engine) initModuleCallIn(
 		pv, err := transform.CtyToPropertyValue(val)
 		if err == nil {
 			inputs[name] = pv
-			inputDeps[name] = eval.CollectDepURNs(val)
 		}
 	}
 
@@ -4416,13 +4418,10 @@ func (e *Engine) initModuleCallIn(
 			return nil, err
 		}
 		componentOpts := &ResourceOptions{
-			Parent:               parentURN,
-			Providers:            passedProviders,
-			PropertyDependencies: inputDeps,
+			Parent:    parentURN,
+			Providers: passedProviders,
 		}
-		for _, deps := range inputDeps {
-			componentOpts.DependsOn = append(componentOpts.DependsOn, deps...)
-		}
+		componentOpts.DependsOn = append(componentOpts.DependsOn, allDependencies(property.NewMap(inputs))...)
 		componentOpts.DependsOn = e.cellURNs.widen(componentOpts.DependsOn)
 		componentOpts.Aliases = e.moduleComponentAliases(instPath)
 		if mod.Protect != nil {
@@ -4675,14 +4674,13 @@ func (e *Engine) registerComponentResource(
 
 	deps := opts.DependsOn
 	resp, err := e.resmon.RegisterResource(ctx, RegisterResourceRequest{
-		Type:                 typeToken,
-		Name:                 name,
-		Inputs:               inputs,
-		Dependencies:         deps,
-		PropertyDependencies: opts.PropertyDependencies,
-		Parent:               opts.Parent,
-		Protect:              opts.Protect,
-		Providers:            opts.Providers,
+		Type:         typeToken,
+		Name:         name,
+		Inputs:       inputs,
+		Dependencies: deps,
+		Parent:       opts.Parent,
+		Protect:      opts.Protect,
+		Providers:    opts.Providers,
 	})
 	if err != nil {
 		return "", "", property.Map{}, err
@@ -4811,8 +4809,8 @@ func Validate(config *ast.Config) []error {
 // expression, so no function fires early while values reached through locals
 // still carry their DepMarks. Traversals that do not resolve are skipped —
 // notably self, which is only in scope once a postcondition hook fires.
-func checkRuleDeps(rules []*ast.CheckRule, hclCtx *hcl.EvalContext) []string {
-	var deps []string
+func checkRuleDeps(rules []*ast.CheckRule, hclCtx *hcl.EvalContext) []urn.URN {
+	var deps []urn.URN
 	for _, rule := range rules {
 		for _, expr := range []hcl.Expression{rule.Condition, rule.ErrorMessage} {
 			if expr == nil {
@@ -4852,8 +4850,8 @@ func bodyTraversals(body hcl.Body) []hcl.Traversal {
 	return traversals
 }
 
-func provisionerDeps(res *ast.Resource, hclCtx *hcl.EvalContext) []string {
-	var deps []string
+func provisionerDeps(res *ast.Resource, hclCtx *hcl.EvalContext) []urn.URN {
+	var deps []urn.URN
 	collect := func(body hcl.Body) {
 		for _, traversal := range bodyTraversals(body) {
 			val, diags := traversal.TraverseAbs(hclCtx)
@@ -5260,19 +5258,19 @@ func (e *Engine) checkConfigPulumiVersion(
 // resource reference mark, while a reference to a resource with count or
 // for_each yields a tuple or object of such instance values. An attribute of a
 // resource inherits the mark but not its hash, so it yields no URNs.
-func resourceURNsFromValue(val cty.Value) []string {
+func resourceURNsFromValue(val cty.Value) []urn.URN {
 	if u, ok := eval.ResourceReferenceURN(val); ok {
-		return []string{string(u)}
+		return []urn.URN{u}
 	}
 	val, _ = val.Unmark()
 	if val.IsNull() || !val.IsKnown() || !val.CanIterateElements() {
 		return nil
 	}
-	var urns []string
+	var urns []urn.URN
 	for it := val.ElementIterator(); it.Next(); {
 		_, el := it.Element()
 		if u, ok := eval.ResourceReferenceURN(el); ok {
-			urns = append(urns, string(u))
+			urns = append(urns, u)
 		}
 	}
 	return urns
@@ -5305,4 +5303,12 @@ func renderErrorMessage(v cty.Value) string {
 		return sensitiveErrorMessageRef
 	}
 	return ctyAsString(v)
+}
+
+func sliceToString[T ~string](s []T) []string {
+	dst := make([]string, len(s))
+	for i, v := range s {
+		dst[i] = string(v)
+	}
+	return dst
 }

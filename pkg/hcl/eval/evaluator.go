@@ -88,22 +88,64 @@ func stripSyntheticAttributes(val cty.Value) cty.Value {
 
 // CollectDepURNs returns every distinct URN carried by a DepMark anywhere
 // in val's value tree.
-func CollectDepURNs(val cty.Value) []string {
-	var urns []string
-	seen := make(map[string]bool)
+func CollectDepURNs(val cty.Value) []urn.URN {
+	var urns []urn.URN
+	seen := make(map[urn.URN]bool)
 	_, marks := val.UnmarkDeep()
 	for m := range marks {
 		dm, ok := m.(DepMark)
 		if !ok {
 			continue
 		}
-		s := string(dm)
+		s := urn.URN(dm)
 		if !seen[s] {
 			seen[s] = true
 			urns = append(urns, s)
 		}
 	}
 	return urns
+}
+
+// UnmarkDeps removes the DepMarks on val itself and returns their URNs. Marks
+// of other kinds, and marks nested inside val, stay in place.
+func UnmarkDeps(val cty.Value) (cty.Value, []urn.URN) {
+	unmarked, marks := val.Unmark()
+	var urns []urn.URN
+	kept := make(cty.ValueMarks, len(marks))
+	for m := range marks {
+		if dm, ok := m.(DepMark); ok {
+			urns = append(urns, urn.URN(dm))
+		} else {
+			kept[m] = struct{}{}
+		}
+	}
+	return unmarked.WithMarks(kept), urns
+}
+
+// WithoutDepMarks removes every DepMark from val, at any depth. Marks of
+// other kinds stay in place.
+func WithoutDepMarks(val cty.Value) cty.Value {
+	unmarked, pathMarks := val.UnmarkDeepWithPaths()
+	kept := make([]cty.PathValueMarks, 0, len(pathMarks))
+	for _, pm := range pathMarks {
+		marks := make(cty.ValueMarks, len(pm.Marks))
+		for m := range pm.Marks {
+			if _, ok := m.(DepMark); !ok {
+				marks[m] = struct{}{}
+			}
+		}
+		kept = append(kept, cty.PathValueMarks{Path: pm.Path, Marks: marks})
+	}
+	return unmarked.MarkWithPaths(kept)
+}
+
+// DepMarks returns a DepMark for each URN.
+func DepMarks(urns []urn.URN) cty.ValueMarks {
+	marks := make(cty.ValueMarks, len(urns))
+	for _, u := range urns {
+		marks[DepMark(u)] = struct{}{}
+	}
+	return marks
 }
 
 // SensitiveArgumentDiagnostic returns the diagnostic Terraform emits when
@@ -134,7 +176,7 @@ func SensitiveArgumentDiagnostic(argName string, expr hcl.Expression) *hcl.Diagn
 // expression references — even though count itself is not applied, a
 // reference in it establishes a dependency, as in TF.
 // Returns (1, false, false, nil, nil) if expr is nil (no count specified).
-func (e *Evaluator) EvaluateCount(expr hcl.Expression) (count int, isBool bool, unknown bool, deps []string, diags hcl.Diagnostics) {
+func (e *Evaluator) EvaluateCount(expr hcl.Expression) (count int, isBool bool, unknown bool, deps []urn.URN, diags hcl.Diagnostics) {
 	if expr == nil {
 		return 1, false, false, nil, nil
 	}
@@ -203,7 +245,7 @@ func (e *Evaluator) EvaluateCount(expr hcl.Expression) (count int, isBool bool, 
 // known. deps holds the URNs of the resources the expression references, so a
 // reference in for_each establishes a dependency, as in TF.
 // Returns a nil map if expr is nil (no for_each specified).
-func (e *Evaluator) EvaluateForEach(expr hcl.Expression) (result map[string]cty.Value, unknown bool, deps []string, diags hcl.Diagnostics) {
+func (e *Evaluator) EvaluateForEach(expr hcl.Expression) (result map[string]cty.Value, unknown bool, deps []urn.URN, diags hcl.Diagnostics) {
 	if expr == nil {
 		return nil, false, nil, nil
 	}

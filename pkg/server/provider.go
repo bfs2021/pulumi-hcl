@@ -206,6 +206,8 @@ type constructResourceMonitor struct {
 	componentURN urn.URN
 	outputs      property.Map
 
+	callOutputValues callOutputValuesProbe
+
 	// mapOutputs transforms the HCL module's top-level outputs into the
 	// component's output property map before they are registered.
 	mapOutputs func(property.Map) property.Map
@@ -305,24 +307,25 @@ func (m *constructResourceMonitor) RegisterResource(
 	}
 
 	resp, err := m.client.RegisterResource(ctx, &pulumirpc.RegisterResourceRequest{
-		Type:                req.Type,
-		Name:                name,
-		Custom:              req.Custom,
-		Object:              inputs,
-		Parent:              string(parent),
-		Dependencies:        req.Dependencies,
-		Provider:            req.Provider,
-		Providers:           req.Providers,
-		Protect:             &req.Protect,
-		DeleteBeforeReplace: req.DeleteBeforeReplace,
-		IgnoreChanges:       ignoreChanges,
-		PackageRef:          string(req.PackageRef),
-		Version:             req.Version,
-		PluginDownloadURL:   req.PluginDownloadURL,
-		Hooks:               hooksToProto(req.Hooks),
-		AcceptSecrets:       true,
-		AcceptResources:     true,
-		AcceptsByteString:   true,
+		Type:                 req.Type,
+		Name:                 name,
+		Custom:               req.Custom,
+		Object:               inputs,
+		Parent:               string(parent),
+		Dependencies:         sliceToString(req.Dependencies),
+		PropertyDependencies: propertyDependenciesToProto(req.Inputs),
+		Provider:             req.Provider,
+		Providers:            req.Providers,
+		Protect:              &req.Protect,
+		DeleteBeforeReplace:  req.DeleteBeforeReplace,
+		IgnoreChanges:        ignoreChanges,
+		PackageRef:           string(req.PackageRef),
+		Version:              req.Version,
+		PluginDownloadURL:    req.PluginDownloadURL,
+		Hooks:                hooksToProto(req.Hooks),
+		AcceptSecrets:        true,
+		AcceptResources:      true,
+		AcceptsByteString:    true,
 	})
 	if err != nil {
 		return nil, err
@@ -443,7 +446,7 @@ func (m *constructResourceMonitor) Invoke(
 		PackageRef:        string(req.PackageRef),
 		AcceptResources:   true,
 		AcceptsByteString: true,
-		DependsOn:         req.DependsOn,
+		DependsOn:         sliceToString(req.DependsOn),
 	})
 	if err != nil {
 		return nil, err
@@ -471,33 +474,22 @@ func (m *constructResourceMonitor) Call(
 	ctx context.Context,
 	req run.CallRequest,
 ) (*run.CallResponse, error) {
-	argsStruct, err := plugin.MarshalProperties(resource.ToResourcePropertyMap(req.Args), constructMarshalOptions())
+	outputValues, err := m.callOutputValues.get(ctx, m.client)
 	if err != nil {
-		return nil, fmt.Errorf("marshaling args: %w", err)
+		return nil, err
 	}
-
-	resp, err := m.client.Call(ctx, &pulumirpc.ResourceCallRequest{
-		Tok:               req.Token,
-		Args:              argsStruct,
-		PackageRef:        string(req.PackageRef),
-		AcceptsByteString: true,
-	})
+	ret, checkFailures, err := callMethod(ctx, m.client, req, outputValues, constructMarshalOptions())
 	if err != nil {
-		return nil, fmt.Errorf("calling method: %w", err)
+		return nil, err
 	}
 
 	var failures []string
-	for _, f := range resp.Failures {
+	for _, f := range checkFailures {
 		failures = append(failures, f.Reason)
 	}
 
-	ret, err := plugin.UnmarshalProperties(resp.Return, constructMarshalOptions())
-	if err != nil {
-		return nil, fmt.Errorf("unmarshaling return: %w", err)
-	}
-
 	return &run.CallResponse{
-		Return:   resource.FromResourcePropertyMap(ret),
+		Return:   ret,
 		Failures: failures,
 	}, nil
 }
@@ -565,4 +557,12 @@ func (m *constructResourceMonitor) ResolveURN(parent urn.URN, token, name string
 		parentType = parent.QualifiedType()
 	}
 	return urn.New(m.componentURN.Stack(), m.componentURN.Project(), parentType, tokens.Type(token), name), name
+}
+
+func sliceToString[T ~string, A ~[]T](s A) []string {
+	dst := make([]string, len(s))
+	for i, v := range s {
+		dst[i] = string(v)
+	}
+	return dst
 }
