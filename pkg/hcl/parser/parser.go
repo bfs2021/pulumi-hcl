@@ -44,11 +44,10 @@ func NewParser() *Parser {
 }
 
 // ParseDirectory parses all HCL files in a directory into a configuration.
+// If the diagnostics have errors, the configuration holds the blocks that the
+// parser recovered, so that a caller can find more errors in them.
 func (p *Parser) ParseDirectory(dir string) (*ast.Config, hcl.Diagnostics) {
 	files, diags := p.loader.LoadDirectory(dir)
-	if diags.HasErrors() {
-		return nil, diags
-	}
 
 	primary, override := map[string]*hcl.File{}, map[string]*hcl.File{}
 	for path, file := range files {

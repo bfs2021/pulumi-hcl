@@ -32,6 +32,7 @@ import (
 	regaddr "github.com/opentofu/registry-address/v2"
 	"github.com/opentofu/svchost"
 	"github.com/opentofu/svchost/disco"
+	"github.com/pulumi/pulumi-hcl/pkg/hcl/parser"
 	"github.com/pulumi/pulumi-hcl/vendored/getmodules"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -485,7 +486,9 @@ func TestLoadModule_ParseFailureDiagnostics(t *testing.T) {
 			})
 			loaded, diags, err := l.LoadModule(t.Context(), "./mod", "", t.TempDir())
 			require.NoError(t, err)
-			assert.Nil(t, loaded)
+			partial, parseDiags := parser.NewParser().ParseDirectory(pkg)
+			assert.Equal(t, &LoadedModule{Config: partial, SourcePath: pkg}, loaded)
+			assert.Equal(t, parseDiags, diags)
 			assert.True(t, diags.HasErrors())
 		})
 	}

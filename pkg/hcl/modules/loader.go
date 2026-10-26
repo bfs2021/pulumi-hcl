@@ -175,7 +175,8 @@ func defaultCacheDir() string {
 // LoadModule loads a module from the given source. versionConstraint is a
 // Terraform-style constraint (`~> 4.0`, `>= 1.0.0`, `4.2.1`); ignored for
 // non-registry sources. Resolution failures return an error; parsing failures
-// return error diagnostics and a nil module. Cached loads return the same module
+// return error diagnostics and a module that holds the blocks that the parser
+// recovered (see parser.ParseDirectory). Cached loads return the same module
 // and diagnostics, including warnings and parsing failures. Returned results
 // are shared and must not be mutated by callers.
 func (l *Loader) LoadModule(ctx context.Context, source, versionConstraint, callerDir string) (*LoadedModule, hcl.Diagnostics, error) {
@@ -195,12 +196,19 @@ func (l *Loader) LoadModule(ctx context.Context, source, versionConstraint, call
 	}
 
 	config, diags := l.parser.ParseDirectory(resolvedPath)
-	var module *LoadedModule
-	if !diags.HasErrors() {
-		module = &LoadedModule{Config: config, SourcePath: resolvedPath, Version: resolvedVersion}
-	}
+	module := &LoadedModule{Config: config, SourcePath: resolvedPath, Version: resolvedVersion}
 	l.cache[resolvedPath] = moduleLoadResult{module: module, diags: diags}
 	return module, diags, nil
+}
+
+// CannotLoad is the diagnostic for a module call whose source fails to load.
+func CannotLoad(mod *ast.Module, err error) *hcl.Diagnostic {
+	return &hcl.Diagnostic{
+		Severity: hcl.DiagError,
+		Summary:  fmt.Sprintf("Cannot load module %q", mod.Source),
+		Detail:   err.Error(),
+		Subject:  mod.DeclRange.Ptr(),
+	}
 }
 
 // ResolveDir resolves a module source to its directory on disk — downloading it

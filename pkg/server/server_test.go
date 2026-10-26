@@ -15,6 +15,7 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"os"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 	"testing"
 
 	"github.com/blang/semver"
+	"github.com/pulumi/pulumi-hcl/pkg/hcl/ast"
 	"github.com/pulumi/pulumi-hcl/pkg/hcl/parser"
 	"github.com/pulumi/pulumi-hcl/pkg/hcl/run"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
@@ -30,6 +32,8 @@ import (
 	pulumirpc "github.com/pulumi/pulumi/sdk/v3/proto/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -533,6 +537,15 @@ resource "simple_resource" "r" {
 	assert.Empty(t, resp.Specs)
 }
 
+func requireMissingNonPulumiSDKs(
+	t *testing.T, config *ast.Config, sdks map[string]sdkInfo, workDir string,
+) []string {
+	t.Helper()
+	missing, err := missingNonPulumiSDKs(t.Context(), config, sdks, workDir)
+	require.NoError(t, err)
+	return missing
+}
+
 // missingNonPulumiSDKs must find the SDK directory under the resolved package
 // name when the required_providers local name renames the provider.
 func TestMissingNonPulumiSDKs_RenamedLocalName(t *testing.T) {
@@ -561,9 +574,9 @@ resource "simple_resource" "r" {
 	sdks := map[string]sdkInfo{
 		"simple": {desc: bridgedSDK("simple")},
 	}
-	assert.Empty(t, missingNonPulumiSDKs(t.Context(), config, sdks, dir))
+	assert.Empty(t, requireMissingNonPulumiSDKs(t, config, sdks, dir))
 	assert.Equal(t, []string{"hashicorp/simple"},
-		missingNonPulumiSDKs(t.Context(), config, nil, dir))
+		requireMissingNonPulumiSDKs(t, config, nil, dir))
 }
 
 // TestGetRequiredPackages_SameSourceVersionIntersection mirrors tofu: two
@@ -906,14 +919,14 @@ data "archive_file" "lambda" {}
 	// archive) must be reported missing.
 	assert.Equal(t,
 		[]string{"hashicorp/archive", "hashicorp/aws"},
-		missingNonPulumiSDKs(t.Context(), cfg, nil, ""))
+		requireMissingNonPulumiSDKs(t, cfg, nil, ""))
 
 	// Once both have SDKs, nothing is missing.
 	sdks := map[string]sdkInfo{
 		"aws":     {desc: bridgedSDK("aws")},
 		"archive": {desc: bridgedSDK("archive")},
 	}
-	assert.Empty(t, missingNonPulumiSDKs(t.Context(), cfg, sdks, ""))
+	assert.Empty(t, requireMissingNonPulumiSDKs(t, cfg, sdks, ""))
 
 	// A pulumi-source provider needs no SDK even when it's only referenced
 	// by a resource type prefix.
@@ -929,7 +942,7 @@ resource "aws_s3_bucket" "b" {}
 `
 	cfgPulumi, diags := parser.NewParser().ParseSource("main.tf", []byte(pulumiSrc))
 	require.False(t, diags.HasErrors(), "diags: %v", diags)
-	assert.Empty(t, missingNonPulumiSDKs(t.Context(), cfgPulumi, nil, ""))
+	assert.Empty(t, requireMissingNonPulumiSDKs(t, cfgPulumi, nil, ""))
 }
 
 func TestMissingNonPulumiSDKs_BuiltinProvider(t *testing.T) {
@@ -942,7 +955,7 @@ func TestMissingNonPulumiSDKs_BuiltinProvider(t *testing.T) {
 	cfg, diags := parser.NewParser().ParseSource("main.tf", []byte(src))
 	require.False(t, diags.HasErrors(), "diags: %v", diags)
 
-	assert.Empty(t, missingNonPulumiSDKs(t.Context(), cfg, nil, ""))
+	assert.Empty(t, requireMissingNonPulumiSDKs(t, cfg, nil, ""))
 }
 
 // A pulumi-sourced provider declared only in a child module must not be
@@ -977,7 +990,7 @@ resource "example_resource" "hello" {}
 	cfg, diags := parser.NewParser().ParseDirectory(dir)
 	require.False(t, diags.HasErrors(), "diags: %v", diags)
 
-	assert.Empty(t, missingNonPulumiSDKs(t.Context(), cfg, nil, dir))
+	assert.Empty(t, requireMissingNonPulumiSDKs(t, cfg, nil, dir))
 }
 
 // A provider local name that contains underscores (e.g. "snake_names") must
@@ -1002,7 +1015,7 @@ resource "snake_names_cool_module_some_resource" "first" {
 	cfg, diags := parser.NewParser().ParseSource("main.tf", []byte(src))
 	require.False(t, diags.HasErrors(), "diags: %v", diags)
 
-	assert.Empty(t, missingNonPulumiSDKs(t.Context(), cfg, nil, ""))
+	assert.Empty(t, requireMissingNonPulumiSDKs(t, cfg, nil, ""))
 }
 
 // Implicit provider inside a child module must surface at the top — without
@@ -1029,7 +1042,7 @@ resource "aws_s3_bucket" "b" {}
 
 	assert.Equal(t,
 		[]string{"hashicorp/aws"},
-		missingNonPulumiSDKs(t.Context(), cfg, nil, dir))
+		requireMissingNonPulumiSDKs(t, cfg, nil, dir))
 }
 
 // Same recursion via the module's `required_providers` block (no resources).
@@ -1061,7 +1074,7 @@ terraform {
 
 	assert.Equal(t,
 		[]string{"hashicorp/awscc"},
-		missingNonPulumiSDKs(t.Context(), cfg, nil, dir))
+		requireMissingNonPulumiSDKs(t, cfg, nil, dir))
 }
 
 // terraform_remote_state is served by the external pulumi-terraform package, so
@@ -1186,6 +1199,246 @@ func getRequiredPackages(t *testing.T, dir string) *pulumirpc.GetRequiredPackage
 	return resp
 }
 
+// logRecorder is an engine client that records the messages logged to it.
+type logRecorder struct {
+	pulumirpc.EngineClient
+	logs []*pulumirpc.LogRequest
+}
+
+func (r *logRecorder) Log(
+	_ context.Context, req *pulumirpc.LogRequest, _ ...grpc.CallOption,
+) (*emptypb.Empty, error) {
+	r.logs = append(r.logs, req)
+	return &emptypb.Empty{}, nil
+}
+
+// TestGetRequiredPackages_InvalidProgram verifies that a program which fails
+// to parse or to resolve, in its root, a component or a module it calls, logs
+// each error to the engine once and fails, instead of reporting that it
+// requires no packages. A failure does not stop the search for other errors.
+func TestGetRequiredPackages_InvalidProgram(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		files    map[string]string
+		wantLogs func(dir string) []string
+	}{
+		{
+			name: "root",
+			files: map[string]string{
+				"main.tf": `
+ephemeral "random_password" "db" {}
+
+not_a_block "x" {}
+`,
+			},
+			wantLogs: func(dir string) []string {
+				return []string{
+					filepath.Join(dir, "main.tf") + `:2,1-10: Unsupported block type; ` +
+						`Blocks of type "ephemeral" are not expected here.`,
+					filepath.Join(dir, "main.tf") + `:4,1-12: Unsupported block type; ` +
+						`Blocks of type "not_a_block" are not expected here.`,
+				}
+			},
+		},
+		{
+			name: "child module",
+			files: map[string]string{
+				"main.tf": `
+module "child" {
+  source = "./child"
+}
+`,
+				"child/main.tf": `resource "random_pet" "p" {`,
+			},
+			wantLogs: func(dir string) []string {
+				return []string{
+					filepath.Join(dir, "child", "main.tf") + `:1,27-28: Unclosed configuration block; ` +
+						`There is no closing brace for this block before the end of the file. ` +
+						`This may be caused by incorrect brace nesting elsewhere in this file.`,
+				}
+			},
+		},
+		{
+			name: "unresolvable module",
+			files: map[string]string{
+				"main.tf": `
+module "child" {
+  source = "./missing"
+}
+`,
+			},
+			wantLogs: func(dir string) []string {
+				return []string{
+					filepath.Join(dir, "main.tf") + `:2,1-15: Cannot load module "./missing"; ` +
+						`resolving module source "./missing": ` +
+						"module directory does not exist: " + filepath.Join(dir, "missing"),
+				}
+			},
+		},
+		{
+			name: "module called twice",
+			files: map[string]string{
+				"main.tf": `
+module "a" {
+  source = "./child"
+}
+
+module "b" {
+  source = "./child"
+}
+`,
+				"child/main.tf": `not_a_block "x" {}`,
+			},
+			wantLogs: func(dir string) []string {
+				return []string{
+					filepath.Join(dir, "child", "main.tf") + `:1,1-12: Unsupported block type; ` +
+						`Blocks of type "not_a_block" are not expected here.`,
+				}
+			},
+		},
+		{
+			name: "module called from a file with a syntax error",
+			files: map[string]string{
+				"main.tf": `
+module "child" {
+  source = "./child"
+}
+
+output "x" {
+  value =
+}
+`,
+				"child/main.tf": `not_a_block "x" {}`,
+			},
+			wantLogs: func(dir string) []string {
+				return []string{
+					filepath.Join(dir, "main.tf") + `:7,10-8,1: Invalid expression; ` +
+						`Expected the start of an expression, but found an invalid expression token.`,
+					filepath.Join(dir, "child", "main.tf") + `:1,1-12: Unsupported block type; ` +
+						`Blocks of type "not_a_block" are not expected here.`,
+				}
+			},
+		},
+		{
+			name: "component called as a module",
+			files: map[string]string{
+				"PulumiPlugin.yaml": "runtime: hcl\n",
+				"main.tf": `
+module "a" {
+  source = "./modules/a"
+}
+`,
+				"modules/a/main.tf": `not_a_block "a" {}`,
+			},
+			wantLogs: func(dir string) []string {
+				return []string{
+					filepath.Join(dir, "modules", "a", "main.tf") + `:1,1-12: Unsupported block type; ` +
+						`Blocks of type "not_a_block" are not expected here.`,
+				}
+			},
+		},
+		{
+			name: "every failure",
+			files: map[string]string{
+				"broken.tf": `resource "random_pet" "p" {`,
+				"main.tf": `
+module "bad" {
+  source = "./bad"
+}
+
+module "missing" {
+  source = "./missing"
+}
+`,
+				"bad/main.tf": `ephemeral "random_password" "db" {}`,
+				"bad/calls.tf": `
+module "grandchild" {
+  source = "./grandchild"
+}
+`,
+				"bad/grandchild/main.tf": `not_a_block "x" {}`,
+			},
+			wantLogs: func(dir string) []string {
+				return []string{
+					filepath.Join(dir, "broken.tf") + `:1,27-28: Unclosed configuration block; ` +
+						`There is no closing brace for this block before the end of the file. ` +
+						`This may be caused by incorrect brace nesting elsewhere in this file.`,
+					filepath.Join(dir, "bad", "main.tf") + `:1,1-10: Unsupported block type; ` +
+						`Blocks of type "ephemeral" are not expected here.`,
+					filepath.Join(dir, "bad", "grandchild", "main.tf") + `:1,1-12: Unsupported block type; ` +
+						`Blocks of type "not_a_block" are not expected here.`,
+					filepath.Join(dir, "main.tf") + `:6,1-17: Cannot load module "./missing"; ` +
+						`resolving module source "./missing": ` +
+						"module directory does not exist: " + filepath.Join(dir, "missing"),
+				}
+			},
+		},
+		{
+			name: "component package",
+			files: map[string]string{
+				"PulumiPlugin.yaml": "runtime: hcl\n",
+				"main.tf":           `not_a_block "root" {}`,
+				"modules/a/main.tf": `not_a_block "a" {}`,
+				"modules/b/main.tf": `output "b" { value = 1 }`,
+			},
+			wantLogs: func(dir string) []string {
+				return []string{
+					filepath.Join(dir, "main.tf") + `:1,1-12: Unsupported block type; ` +
+						`Blocks of type "not_a_block" are not expected here.`,
+					filepath.Join(dir, "modules", "a", "main.tf") + `:1,1-12: Unsupported block type; ` +
+						`Blocks of type "not_a_block" are not expected here.`,
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			require.NoError(t, writeFiles(dir, tt.files))
+			engine := &logRecorder{}
+			host := &LanguageHost{engine: engine}
+			_, err := host.GetRequiredPackages(t.Context(), &pulumirpc.GetRequiredPackagesRequest{
+				Info: &pulumirpc.ProgramInfo{
+					ProgramDirectory: dir,
+					RootDirectory:    dir,
+					EntryPoint:       ".",
+				},
+			})
+			require.ErrorIs(t, err, errInvalidProgram)
+
+			var logs []string
+			for _, l := range engine.logs {
+				require.Equal(t, pulumirpc.LogSeverity_ERROR, l.Severity)
+				logs = append(logs, l.Message)
+			}
+			assert.Equal(t, tt.wantLogs(dir), logs)
+		})
+	}
+}
+
+// TestGetRequiredPackages_InvalidProgramWithoutEngine verifies that, with no
+// engine to log to, the diagnostics of an invalid program are the error.
+func TestGetRequiredPackages_InvalidProgramWithoutEngine(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	require.NoError(t, writeFiles(dir, map[string]string{"main.tf": `not_a_block "x" {}`}))
+	host := &LanguageHost{}
+	_, err := host.GetRequiredPackages(t.Context(), &pulumirpc.GetRequiredPackagesRequest{
+		Info: &pulumirpc.ProgramInfo{
+			ProgramDirectory: dir,
+			RootDirectory:    dir,
+			EntryPoint:       ".",
+		},
+	})
+	assert.EqualError(t, err, filepath.Join(dir, "main.tf")+`:1,1-12: Unsupported block type; `+
+		`Blocks of type "not_a_block" are not expected here.`)
+}
+
 func TestGetRequiredPackages_SubmoduleComponentProviders(t *testing.T) {
 	t.Parallel()
 
@@ -1216,6 +1469,37 @@ func TestGetRequiredPackages_ProgramSkipsUnreferencedModules(t *testing.T) {
 	resp := getRequiredPackages(t, writeSubmodulePackage(t, false, true))
 	assert.Empty(t, resp.Packages)
 	assert.Empty(t, resp.Specs)
+}
+
+// TestGetRequiredPackages_SymlinkedRootFile verifies that a symlinked .tf file
+// in the program directory counts, as it does when the program runs.
+func TestGetRequiredPackages_SymlinkedRootFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	require.NoError(t, writeFiles(dir, map[string]string{
+		"shared/providers.tf": `
+terraform {
+  required_providers {
+    rollbar = {
+      source  = "rollbar/rollbar"
+      version = ">= 1.0"
+    }
+  }
+}
+`,
+	}))
+	program := filepath.Join(dir, "program")
+	require.NoError(t, os.Mkdir(program, 0o755))
+	require.NoError(t, os.Symlink(filepath.Join(dir, "shared", "providers.tf"), filepath.Join(program, "providers.tf")))
+
+	resp := getRequiredPackages(t, program)
+	assert.Empty(t, resp.Packages)
+	assert.Equal(t, []*pulumirpc.PackageSpec{{
+		Source:     "terraform-provider",
+		Version:    bridgePackageVersion,
+		Parameters: []string{"rollbar/rollbar", ">= 1.0"},
+	}}, resp.Specs)
 }
 
 // TestPackageDescriptorFromSchemaExtension verifies that an extension
@@ -1352,7 +1636,8 @@ terraform {
 `
 	config, diags := parser.NewParser().ParseSource("main.tf", []byte(src))
 	require.False(t, diags.HasErrors(), diags.Error())
-	_, pulumiPkgs, _ := collectRequirements(t.Context(), nil, config, "")
+	_, pulumiPkgs, _, err := collectRequirements(t.Context(), nil, config, "")
+	require.NoError(t, err)
 
 	t.Run("pin", func(t *testing.T) {
 		t.Parallel()

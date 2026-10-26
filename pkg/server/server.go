@@ -217,7 +217,7 @@ func (host *LanguageHost) GetRequiredPackages(
 		return &pulumirpc.GetRequiredPackagesResponse{}, fmt.Errorf("unable to read SDKs folder: %w", err)
 	}
 
-	tfReqs, pulumiPkgs, err := programRequirements(ctx, req.Info.ProgramDirectory)
+	tfReqs, pulumiPkgs, err := host.programRequirements(ctx, req.Info.ProgramDirectory)
 	if err != nil {
 		return &pulumirpc.GetRequiredPackagesResponse{}, err
 	}
@@ -293,10 +293,16 @@ func (host *LanguageHost) GetRequiredPackages(
 	return &pulumirpc.GetRequiredPackagesResponse{Packages: pkgs, Specs: specs}, nil
 }
 
+// errInvalidProgram is returned after the diagnostics that make the program
+// invalid have been logged to the engine.
+var errInvalidProgram = errors.New("the program is invalid; see the errors above")
+
 // programRequirements resolves every provider referenced by the program's
-// module tree and component directories to its source, skipping directories
-// that fail to parse.
-func programRequirements(
+// module tree and component directories to its source. If a directory or
+// module fails to parse or to resolve, it continues with the rest of the
+// program, then logs each error diagnostic to the engine and returns
+// errInvalidProgram.
+func (host *LanguageHost) programRequirements(
 	ctx context.Context, programDir string,
 ) (tf map[string]*tfRequirement, pulumi map[string]string, err error) {
 	dirs, err := requirementDirs(programDir)
@@ -309,14 +315,58 @@ func programRequirements(
 	pulumi = map[string]string{}
 	aliases := map[string]*ast.RequiredProvider{}
 	visited := map[string]struct{}{}
+	var diags hcl.Diagnostics
 	for _, dir := range dirs {
-		config, diags := p.ParseDirectory(dir)
-		if diags.HasErrors() {
+		// A directory with no .tf files requires nothing: the root of a
+		// package with only submodule components, or a program not yet written.
+		hasFiles, err := parser.DirHasLoadableFiles(dir)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !hasFiles {
 			continue
 		}
-		collectRequirementsRec(ctx, config, dir, tf, pulumi, aliases, loader, visited)
+		// The keys of visited are absolute, as the loader resolves them. A
+		// component that an earlier directory calls as a module was walked then.
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			return nil, nil, err
+		}
+		if _, seen := visited[abs]; seen {
+			continue
+		}
+		visited[abs] = struct{}{}
+		// A directory with errors still parses the files without them, and the
+		// modules those files call can report their own errors.
+		config, dirDiags := p.ParseDirectory(dir)
+		diags = diags.Extend(dirDiags)
+		diags = diags.Extend(collectRequirementsRec(ctx, config, dir, tf, pulumi, aliases, loader, visited))
+	}
+	if diags.HasErrors() {
+		return nil, nil, host.logInvalidProgram(ctx, diags)
 	}
 	return tf, pulumi, nil
+}
+
+// logInvalidProgram logs each error in diags to the engine and returns
+// errInvalidProgram. Without an engine connection, the diagnostics are
+// returned as the error instead.
+func (host *LanguageHost) logInvalidProgram(ctx context.Context, diags hcl.Diagnostics) error {
+	if host.engine == nil {
+		return diags
+	}
+	for _, d := range diags {
+		if d.Severity != hcl.DiagError {
+			continue
+		}
+		if _, err := host.engine.Log(ctx, &pulumirpc.LogRequest{
+			Severity: pulumirpc.LogSeverity_ERROR,
+			Message:  d.Error(),
+		}); err != nil {
+			return fmt.Errorf("logging %q: %w", d.Error(), err)
+		}
+	}
+	return errInvalidProgram
 }
 
 // descriptorForSource returns the on-disk SDK descriptor that satisfies the
@@ -519,11 +569,14 @@ func sdkDescriptors(infos map[string]sdkInfo) map[string]workspace.PackageDescri
 // requirements for the missing-SDK check.
 func programPackages(
 	ctx context.Context, loader *modules.Loader, config *ast.Config, dir string, sdkInfos map[string]sdkInfo,
-) (map[string]workspace.PackageDescriptor, map[string]*tfRequirement) {
+) (map[string]workspace.PackageDescriptor, map[string]*tfRequirement, error) {
+	tfReqs, pulumiPkgs, _, err := collectRequirements(ctx, loader, config, dir)
+	if err != nil {
+		return nil, nil, err
+	}
 	descs := sdkDescriptors(sdkInfos)
-	tfReqs, pulumiPkgs, _ := collectRequirements(ctx, loader, config, dir)
 	addPinnedPulumiPackages(pulumiPkgs, descs)
-	return descs, tfReqs
+	return descs, tfReqs, nil
 }
 
 // addPinnedPulumiPackages adds a name-and-version descriptor to descs for
@@ -549,9 +602,12 @@ func addPinnedPulumiPackages(pulumiPkgs map[string]string, descs map[string]work
 // satisfies. Empty workDir skips module recursion.
 func missingNonPulumiSDKs(
 	ctx context.Context, config *ast.Config, sdks map[string]sdkInfo, workDir string,
-) []string {
-	tfReqs, _, _ := collectRequirements(ctx, modules.NewLoader(modules.LiveResolver(ctx)), config, workDir)
-	return missingSDKs(tfReqs, sdks)
+) ([]string, error) {
+	tfReqs, _, _, err := collectRequirements(ctx, modules.NewLoader(modules.LiveResolver(ctx)), config, workDir)
+	if err != nil {
+		return nil, err
+	}
+	return missingSDKs(tfReqs, sdks), nil
 }
 
 func missingSDKs(tfReqs map[string]*tfRequirement, sdks map[string]sdkInfo) []string {
@@ -595,22 +651,30 @@ func (r *tfRequirement) constraint() string { return strings.Join(sortedKeys(r.c
 // declared only in a child module still resolves from its declared source.
 func collectRequirements(
 	ctx context.Context, loader *modules.Loader, config *ast.Config, workDir string,
-) (tf map[string]*tfRequirement, pulumi map[string]string, aliases map[string]*ast.RequiredProvider) {
+) (tf map[string]*tfRequirement, pulumi map[string]string, aliases map[string]*ast.RequiredProvider, err error) {
 	tf = map[string]*tfRequirement{}
 	pulumi = map[string]string{}
 	aliases = map[string]*ast.RequiredProvider{}
-	collectRequirementsRec(ctx, config, workDir, tf, pulumi, aliases, loader, map[string]struct{}{})
-	return tf, pulumi, aliases
+	// The requirements of a module that fails to load are incomplete and can be
+	// invalid, so they must not be used.
+	diags := collectRequirementsRec(ctx, config, workDir, tf, pulumi, aliases, loader, map[string]struct{}{})
+	if diags.HasErrors() {
+		return nil, nil, nil, diags
+	}
+	return tf, pulumi, aliases, nil
 }
 
+// collectRequirementsRec is collectRequirements, plus the diagnostics of each
+// module that fails to resolve or to parse. It loads each module directory
+// once, so a module that many module blocks call reports its errors once.
 func collectRequirementsRec(
 	ctx context.Context,
 	config *ast.Config, workDir string,
 	tf map[string]*tfRequirement, pulumi map[string]string, aliases map[string]*ast.RequiredProvider,
 	loader *modules.Loader, visited map[string]struct{},
-) {
+) hcl.Diagnostics {
 	if config == nil {
-		return
+		return nil
 	}
 	required := map[string]*ast.RequiredProvider{}
 	if config.Terraform != nil {
@@ -693,28 +757,30 @@ func collectRequirementsRec(
 	}
 
 	if loader == nil {
-		return
+		return nil
 	}
 	// Iterate in a stable order: this walk drives the archive layout when a module
 	// is bundled for parameterization, so a map's random order would make the
 	// bundle non-deterministic.
+	var diags hcl.Diagnostics
 	for _, name := range slices.Sorted(maps.Keys(config.Modules)) {
 		mod := config.Modules[name]
 		if mod.Source == "" {
 			continue
 		}
-		loaded, diags, err := loader.LoadModule(ctx, mod.Source, mod.Version, workDir)
-		if err != nil || diags.HasErrors() {
-			// `pulumi install` surfaces a concrete error later; don't block on it here.
-			logging.V(5).Infof("collectRequirements: loading module %q: %v; %v", mod.Source, err, diags)
+		loaded, loadDiags, err := loader.LoadModule(ctx, mod.Source, mod.Version, workDir)
+		if err != nil {
+			diags = diags.Append(modules.CannotLoad(mod, err))
 			continue
 		}
 		if _, seen := visited[loaded.SourcePath]; seen {
 			continue
 		}
 		visited[loaded.SourcePath] = struct{}{}
-		collectRequirementsRec(ctx, loaded.Config, loaded.SourcePath, tf, pulumi, aliases, loader, visited)
+		diags = diags.Extend(loadDiags)
+		diags = diags.Extend(collectRequirementsRec(ctx, loaded.Config, loaded.SourcePath, tf, pulumi, aliases, loader, visited))
 	}
+	return diags
 }
 
 func sortedKeys[K cmp.Ordered, V any](m map[K]V) []K { return slices.Sorted(maps.Keys(m)) }
@@ -787,8 +853,11 @@ func (host *LanguageHost) Run(
 	if err != nil {
 		return nil, fmt.Errorf("unable to read parameterization: %w", err)
 	}
-	paramDescriptors, tfReqs := programPackages(
+	paramDescriptors, tfReqs, err := programPackages(
 		ctx, modules.NewLoader(modules.LiveResolver(ctx)), config, req.Info.ProgramDirectory, sdkInfos)
+	if err != nil {
+		return &pulumirpc.RunResponse{Error: err.Error()}, nil
+	}
 	if missing := missingSDKs(tfReqs, sdkInfos); len(missing) > 0 {
 		return &pulumirpc.RunResponse{
 			Error: fmt.Sprintf(
@@ -1374,7 +1443,7 @@ func (host *LanguageHost) Link(
 	ctx context.Context,
 	req *pulumirpc.LinkRequest,
 ) (*pulumirpc.LinkResponse, error) {
-	tfReqs, pulumiPkgs, err := programRequirements(ctx, req.Info.ProgramDirectory)
+	tfReqs, pulumiPkgs, err := host.programRequirements(ctx, req.Info.ProgramDirectory)
 	if err != nil {
 		return nil, err
 	}
