@@ -295,6 +295,18 @@ type fileTransformer struct {
 	// comments holds leading comments lexed from the source file, keyed by
 	// the source start byte of the syntactic element that should carry them.
 	comments *comments.Map
+	// forVars holds the schema of each for expression's value variable while
+	// its body is emitted: the properties of the collection's elements and
+	// their bridge mapping. Traversals rooted at the variable read those
+	// elements.
+	forVars map[string]forVar
+}
+
+// forVar is the schema of a for expression's value variable: the properties
+// of the collection's elements and their bridge mapping.
+type forVar struct {
+	props   []*schema.Property
+	mapping *bridge.BodyMapping
 }
 
 // emitLeadingComments writes any source comments that immediately precede the
@@ -1685,6 +1697,13 @@ func (ft *fileTransformer) transformTraversalRef(
 ) (tokens hclwrite.Tokens, block *bridge.FieldMapping) {
 	root := e.Traversal.RootName()
 
+	// A for expression's value variable reads its collection's elements, whose
+	// schema forVars tracks while the body is emitted.
+	if fv, ok := ft.forVars[root]; ok {
+		converted, block := schemaAwareTraversalAttrs(e.Traversal, fv.props, fv.mapping)
+		return hclwrite.TokensForTraversal(converted), block
+	}
+
 	// Provider references: `<pkg>.<alias>.x` → `<alias>.x` in PCL.
 	// Trailing snake_case attrs become camelCase; the synthetic provider
 	// outputs need a casing hint so `URL` doesn't get mangled to `Url`.
@@ -2360,6 +2379,23 @@ func (ft *fileTransformer) transformDynamicIteratorTraversal(trav hcl.Traversal,
 // transformForExpr converts an HCL for-expression to PCL tokens, transforming
 // sub-expressions (e.g., var.names → names).
 func (ft *fileTransformer) transformForExpr(e *hclsyntax.ForExpr) hclwrite.Tokens {
+	// The value variable reads the collection's elements. Register their
+	// schema, if known, so traversals rooted at the variable map names and
+	// read MaxItems=1 blocks the way the bridge flattens them.
+	if fv, ok := ft.forVarProps(e.CollExpr); ok {
+		if ft.forVars == nil {
+			ft.forVars = make(map[string]forVar)
+		}
+		prev, had := ft.forVars[e.ValVar]
+		ft.forVars[e.ValVar] = fv
+		defer func() {
+			if had {
+				ft.forVars[e.ValVar] = prev
+			} else {
+				delete(ft.forVars, e.ValVar)
+			}
+		}()
+	}
 	var keyTokens, condTokens hclwrite.Tokens
 	if e.KeyExpr != nil {
 		keyTokens = ft.transformExpr(e.KeyExpr)
@@ -2369,6 +2405,59 @@ func (ft *fileTransformer) transformForExpr(e *hclsyntax.ForExpr) hclwrite.Token
 	}
 	return forExprTokens(e.KeyVar, e.ValVar,
 		ft.transformExpr(e.CollExpr), keyTokens, ft.transformExpr(e.ValExpr), condTokens, e.Group)
+}
+
+// forVarProps returns the schema of a for expression's value variable: the
+// properties of the elements its collection reads and their bridge mapping.
+// The collection is a traversal into a resource: a reference reads the
+// resource's instances, a MaxItems=1 block reads its one element's object,
+// and a list-typed attribute reads its elements. Unknown collections have no
+// schema.
+func (ft *fileTransformer) forVarProps(coll hclsyntax.Expression) (forVar, bool) {
+	c, ok := coll.(*hclsyntax.ScopeTraversalExpr)
+	if !ok {
+		return forVar{}, false
+	}
+	root := c.Traversal.RootName()
+	res := ft.resourceSchemas[root]
+	if res == nil {
+		return forVar{}, false
+	}
+	var currentType schema.Type = &schema.ObjectType{Properties: res.Properties}
+	mapping := ft.resourceMappings[root]
+	flattened := false
+	for _, step := range c.Traversal[2:] {
+		switch attr := step.(type) {
+		case hcl.TraverseAttr:
+			fm := mapping.Lookup(attr.Name)
+			_, prop, nested := lookupProperty(attr.Name, propertiesOf(currentType), mapping)
+			if prop == nil {
+				return forVar{}, false
+			}
+			currentType, mapping = prop.Type, nested
+			flattened = fm != nil && fm.MaxItemsOne
+		case hcl.TraverseIndex:
+			if !flattened {
+				currentType = elementTypeOf(currentType)
+			}
+			flattened = false
+		}
+		if currentType == nil {
+			return forVar{}, false
+		}
+	}
+	// A splat or reference over a MaxItems=1 block reads its one element;
+	// one over a list-typed attribute reads its elements.
+	if flattened {
+		return forVar{propertiesOf(currentType), mapping}, true
+	}
+	if arr, ok := codegen.UnwrapType(currentType).(*schema.ArrayType); ok {
+		currentType = arr.ElementType
+	}
+	if obj, ok := codegen.UnwrapType(currentType).(*schema.ObjectType); ok {
+		return forVar{obj.Properties, mapping}, true
+	}
+	return forVar{}, false
 }
 
 // forExprTokens builds the tokens of a PCL for-expression. It is a map

@@ -3489,6 +3489,12 @@ func perIterationIndexTokens(kind rangeKind) hclwrite.Tokens {
 // ScopeTraversalExpression with Parts[0]=SplatVariable and traversal steps
 // [TraverseRoot, TraverseAttr("value"), ...]. We emit source, [*], then the
 // traversal steps after the root.
+//
+// When the each path crosses a MaxItems=1 set block, which HCL reads with
+// one(), the splat becomes a for-expression, whose steps can:
+//
+// PCL:  source[*].block.value
+// HCL:  [for v in source : one(v.block).value]
 func (g *generator) splatTokens(expr *model.SplatExpression) (hclwrite.Tokens, hcl.Diagnostics) {
 	source := splatSource(expr)
 	// An HCL splat reads the list of a MaxItems=1 block the same way a PCL
@@ -3503,12 +3509,6 @@ func (g *generator) splatTokens(expr *model.SplatExpression) (hclwrite.Tokens, h
 	if diags.HasErrors() {
 		return nil, diags
 	}
-
-	tokens := append(sourceTokens,
-		&hclwrite.Token{Type: hclsyntax.TokenOBrack, Bytes: []byte("[")},
-		&hclwrite.Token{Type: hclsyntax.TokenStar, Bytes: []byte("*")},
-		&hclwrite.Token{Type: hclsyntax.TokenCBrack, Bytes: []byte("]")},
-	)
 
 	// Extract the traversal from the Each expression, skipping the root
 	// (which is the SplatVariable, already represented by [*]).
@@ -3533,13 +3533,53 @@ func (g *generator) splatTokens(expr *model.SplatExpression) (hclwrite.Tokens, h
 		// elements end on a MaxItems=1 block reads a list of objects in PCL,
 		// where HCL reads a list of lists.
 		eachPath, _ := schemaAwareRewriteTraversal(props, mapping, eachTraversal)
+		if len(eachPath) > 1 {
+			// The each path crosses a MaxItems=1 set block, which HCL reads
+			// with one(). A splat's steps cannot call one(), so the splat
+			// becomes a for-expression, whose steps can.
+			return splatForTokens(sourceTokens, eachPath), diags
+		}
 		eachTraversal = eachPath.indexed()
 	} else {
 		eachTraversal = naiveRewriteTraversal(eachTraversal)
 	}
 
+	tokens := append(sourceTokens,
+		&hclwrite.Token{Type: hclsyntax.TokenOBrack, Bytes: []byte("[")},
+		&hclwrite.Token{Type: hclsyntax.TokenStar, Bytes: []byte("*")},
+		&hclwrite.Token{Type: hclsyntax.TokenCBrack, Bytes: []byte("]")},
+	)
 	tokens = append(tokens, traversalStepsToTokens(eachTraversal)...)
 	return tokens, diags
+}
+
+// splatForTokens writes a splat whose each path crosses a MaxItems=1 set block
+// as a for-expression over source: HCL cannot index a set, and a splat's steps
+// cannot call one(), so each set is read with one() from the for-expression's
+// iteration variable. Each of path's segments after the first starts at such a
+// set block.
+//
+// PCL:  set[*].opt.label
+// HCL:  [for v in set : one(v.opt).label]
+func splatForTokens(source hclwrite.Tokens, path hclPath) hclwrite.Tokens {
+	iter := hclwrite.TokensForTraversal(hcl.Traversal{hcl.TraverseRoot{Name: "v"}})
+	body := path.tokens(iter)
+	out := hclwrite.Tokens{
+		{Type: hclsyntax.TokenOBrack, Bytes: []byte("[")},
+		{Type: hclsyntax.TokenIdent, Bytes: []byte("for")},
+		{Type: hclsyntax.TokenIdent, Bytes: []byte("v"), SpacesBefore: 1},
+		{Type: hclsyntax.TokenIdent, Bytes: []byte("in"), SpacesBefore: 1},
+	}
+	if len(source) > 0 {
+		source[0].SpacesBefore = 1
+	}
+	out = append(out, source...)
+	out = append(out, &hclwrite.Token{Type: hclsyntax.TokenColon, Bytes: []byte(":"), SpacesBefore: 1})
+	if len(body) > 0 {
+		body[0].SpacesBefore = 1
+	}
+	out = append(out, body...)
+	return append(out, &hclwrite.Token{Type: hclsyntax.TokenCBrack, Bytes: []byte("]")})
 }
 
 // pickUnionVariantFromObjectExpr resolves a const-discriminated union to
