@@ -1867,7 +1867,8 @@ func (g *generator) propertyPathListTokens(
 		}
 		root := path[0].(hcl.TraverseRoot)
 		rel := append(hcl.Traversal{hcl.TraverseAttr{Name: root.Name, SrcRange: root.SrcRange}}, path[1:]...)
-		rel, _ = schemaAwareRewriteTraversal(props, g.resourceMappings[r], rel)
+		relPath, _ := schemaAwareRewriteTraversal(props, g.resourceMappings[r], rel)
+		rel = relPath.indexed()
 		first := rel[0].(hcl.TraverseAttr)
 		path = append(hcl.Traversal{hcl.TraverseRoot{Name: first.Name, SrcRange: first.SrcRange}}, rel[1:]...)
 		elems = append(elems, hclwrite.TokensForTraversal(path))
@@ -2778,36 +2779,73 @@ func (g *generator) getOutputTokens(expr *model.FunctionCallExpression) (hclwrit
 // returned unchanged.
 //
 // The bridge flattens a MaxItems=1 block to its one element, or to null when
-// the block is absent, but HCL reads the block as a list. So a step into such
-// a block gets a [0]. If the traversal ends on such a block, block is its
-// mapping, and the caller must write the value as its one element (see
-// [oneTokens]).
+// the block is absent, but HCL reads the block as a list or a set. So a step
+// into such a list block gets a [0], and a step into such a set block starts a
+// new segment of the path (see [hclPath]). If the traversal ends on such a
+// block, block is its mapping, and the caller must write the value as its one
+// element (see [oneTokens]).
 func schemaAwareRewriteTraversal(
 	props []*schema.Property, mapping *bridge.BodyMapping, traversal hcl.Traversal,
-) (result hcl.Traversal, block *bridge.FieldMapping) {
+) (result hclPath, block *bridge.FieldMapping) {
 	if len(traversal) == 0 || len(props) == 0 {
-		return traversal, nil
+		return hclPath{traversal}, nil
 	}
 	t, ok := traversal[0].(hcl.TraverseAttr)
 	if !ok {
-		return traversal, nil
+		return hclPath{traversal}, nil
 	}
 	for _, p := range props {
 		if p.Name == t.Name {
 			name, fm := hclField(p.Name, mapping)
-			result := hcl.Traversal{hcl.TraverseAttr{Name: name, SrcRange: t.SrcRange}}
+			head := hcl.Traversal{hcl.TraverseAttr{Name: name, SrcRange: t.SrcRange}}
 			rest := traversal[1:]
-			if fm != nil && fm.MaxItemsOne {
-				if len(rest) == 0 {
-					return result, fm
-				}
-				result = append(result, hcl.TraverseIndex{Key: cty.Zero})
+			if fm != nil && fm.MaxItemsOne && len(rest) == 0 {
+				return hclPath{head}, fm
 			}
-			rest, block := schemaAwareRewriteTyped(p.Type, nestedMapping(fm), rest)
-			return append(result, rest...), block
+			restPath, block := schemaAwareRewriteTyped(p.Type, nestedMapping(fm), rest)
+			if fm != nil && fm.MaxItemsOne {
+				if fm.TFSet {
+					return append(hclPath{head}, restPath...), block
+				}
+				head = append(head, hcl.TraverseIndex{Key: cty.Zero})
+			}
+			return restPath.prepend(head), block
 		}
 	}
-	return traversal, nil
+	return hclPath{traversal}, nil
+}
+
+// hclPath is the HCL form of the steps of a PCL traversal. HCL cannot index a
+// set, so a step into a TypeSet MaxItems=1 block reads the one element of the
+// set with one(). Each segment after the first is a step from one() of the
+// value before it.
+type hclPath []hcl.Traversal
+
+// prepend returns p with steps before its first segment.
+func (p hclPath) prepend(steps hcl.Traversal) hclPath {
+	out := append(hclPath{}, p...)
+	out[0] = append(append(hcl.Traversal{}, steps...), p[0]...)
+	return out
+}
+
+// tokens writes p as steps from source.
+func (p hclPath) tokens(source hclwrite.Tokens) hclwrite.Tokens {
+	out := append(source, traversalStepsToTokens(p[0])...)
+	for _, seg := range p[1:] {
+		out = append(hclwrite.TokensForFunctionCall("one", out), traversalStepsToTokens(seg)...)
+	}
+	return out
+}
+
+// indexed returns p as one traversal that indexes each set block with [0]. It
+// is for a context that cannot call one(), such as a resource option path or
+// the steps of a splat.
+func (p hclPath) indexed() hcl.Traversal {
+	out := append(hcl.Traversal{}, p[0]...)
+	for _, seg := range p[1:] {
+		out = append(append(out, hcl.TraverseIndex{Key: cty.Zero}), seg...)
+	}
+	return out
 }
 
 // oneTokens writes tokens, a reference to the MaxItems=1 field fm that HCL
@@ -2840,9 +2878,9 @@ func oneTokens(fm *bridge.FieldMapping, tokens hclwrite.Tokens) hclwrite.Tokens 
 // [schemaAwareRewriteTraversal].
 func schemaAwareRewriteTyped(
 	typ schema.Type, mapping *bridge.BodyMapping, traversal hcl.Traversal,
-) (result hcl.Traversal, block *bridge.FieldMapping) {
+) (result hclPath, block *bridge.FieldMapping) {
 	if len(traversal) == 0 {
-		return traversal, nil
+		return hclPath{traversal}, nil
 	}
 
 	switch t := traversal[0].(type) {
@@ -2857,9 +2895,9 @@ func schemaAwareRewriteTyped(
 			// becomes an index, which keeps it unchanged and valid in HCL.
 			key := hcl.TraverseIndex{Key: cty.StringVal(t.Name), SrcRange: t.SrcRange}
 			rest, block := schemaAwareRewriteTyped(s.ElementType, mapping, traversal[1:])
-			return append(hcl.Traversal{key}, rest...), block
+			return rest.prepend(hcl.Traversal{key}), block
 		default:
-			return traversal, nil
+			return hclPath{traversal}, nil
 		}
 	case hcl.TraverseIndex:
 		var elem schema.Type
@@ -2869,12 +2907,12 @@ func schemaAwareRewriteTyped(
 		case *schema.ArrayType:
 			elem = s.ElementType
 		default:
-			return traversal, nil
+			return hclPath{traversal}, nil
 		}
 		rest, block := schemaAwareRewriteTyped(elem, mapping, traversal[1:])
-		return append(hcl.Traversal{t}, rest...), block
+		return rest.prepend(hcl.Traversal{t}), block
 	default:
-		return traversal, nil
+		return hclPath{traversal}, nil
 	}
 }
 
@@ -2909,11 +2947,11 @@ func traversalStepsToTokens(traversal hcl.Traversal) hclwrite.Tokens {
 // [schemaAwareRewriteTraversal].
 func rewriteInvokeOutputTraversal(
 	fn *schema.Function, mapping *bridge.BodyMapping, traversal hcl.Traversal,
-) (result hcl.Traversal, block *bridge.FieldMapping) {
+) (result hclPath, block *bridge.FieldMapping) {
 	if fn != nil && fn.ReturnType != nil {
 		return schemaAwareRewriteTyped(fn.ReturnType, mapping, traversal)
 	}
-	return naiveRewriteTraversal(traversal), nil
+	return hclPath{naiveRewriteTraversal(traversal)}, nil
 }
 
 // naiveRewriteTraversal rewrites all TraverseAttr names in a traversal from camelCase to
@@ -3072,7 +3110,7 @@ func (g *generator) scopeTraversalRefTokens(
 								hcl.TraverseAttr{Name: ds.name},
 							}
 							rest, block := rewriteInvokeOutputTraversal(invokeSchema, g.invokeMappings[call], traversal[1:])
-							return hclwrite.TokensForTraversal(append(rewritten, rest...)), block, nil
+							return rest.tokens(hclwrite.TokensForTraversal(rewritten)), block, nil
 						}
 					}
 					break
@@ -3087,7 +3125,7 @@ func (g *generator) scopeTraversalRefTokens(
 			if idx, ok := traversal[1].(hcl.TraverseIndex); ok {
 				rewritten = append(rewritten, idx)
 				rest, block := g.rewriteSpilledInvokeTraversal(call, traversal[2:])
-				return hclwrite.TokensForTraversal(append(rewritten, rest...)), block, nil
+				return rest.tokens(hclwrite.TokensForTraversal(rewritten)), block, nil
 			}
 		}
 		return hclwrite.TokensForTraversal(append(rewritten, traversal[1:]...)), nil, nil
@@ -3119,7 +3157,7 @@ func (g *generator) scopeTraversalRefTokens(
 				props = part.Schema.Properties
 			}
 			rest, block := schemaAwareRewriteTraversal(props, g.resourceMappings[part], traversal[1:])
-			return hclwrite.TokensForTraversal(append(rewritten, rest...)), block, nil
+			return rest.tokens(hclwrite.TokensForTraversal(rewritten)), block, nil
 		}
 		hclType, diags := packages.PulumiResourceTokenToHCL(resourceSchemaPackage(part.Schema), resourceSchemaToken(part.Schema, token))
 		if diags.HasErrors() {
@@ -3142,7 +3180,7 @@ func (g *generator) scopeTraversalRefTokens(
 			props = part.Schema.Properties
 		}
 		rest, block := schemaAwareRewriteTraversal(props, g.resourceMappings[part], traversal[1:])
-		return hclwrite.TokensForTraversal(append(rewritten, rest...)), block, nil
+		return rest.tokens(hclwrite.TokensForTraversal(rewritten)), block, nil
 	case *pcl.Component:
 		// Rewrite "someComponent.output" → "module.someComponent.output".
 		rewritten := make(hcl.Traversal, 0, len(traversal)+1)
@@ -3295,8 +3333,8 @@ func (g *generator) relativeTraversalTokens(expr *model.RelativeTraversalExpress
 		return nil, diags
 	}
 	if call := g.invokeResultCall(expr.Source); call != nil {
-		traversal, block := g.rewriteSpilledInvokeTraversal(call, expr.Traversal)
-		tokens := append(sourceTokens, traversalStepsToTokens(traversal)...)
+		path, block := g.rewriteSpilledInvokeTraversal(call, expr.Traversal)
+		tokens := path.tokens(sourceTokens)
 		if block != nil {
 			tokens = oneTokens(block, tokens)
 		}
@@ -3345,7 +3383,7 @@ func (g *generator) rangedInvokeLocal(lv *pcl.LocalVariable) *model.FunctionCall
 // for [rewriteInvokeOutputTraversal].
 func (g *generator) rewriteSpilledInvokeTraversal(
 	call *model.FunctionCallExpression, traversal hcl.Traversal,
-) (hcl.Traversal, *bridge.FieldMapping) {
+) (hclPath, *bridge.FieldMapping) {
 	token, _ := extractStringLiteral(call.Args[0])
 	invokeSchema, _, _ := g.lookupInvokeSchema(token)
 	return rewriteInvokeOutputTraversal(invokeSchema, g.invokeMappings[call], traversal)
@@ -3494,7 +3532,8 @@ func (g *generator) splatTokens(expr *model.SplatExpression) (hclwrite.Tokens, h
 		// TODO[https://github.com/pulumi/pulumi-hcl/issues/729]: A splat whose
 		// elements end on a MaxItems=1 block reads a list of objects in PCL,
 		// where HCL reads a list of lists.
-		eachTraversal, _ = schemaAwareRewriteTraversal(props, mapping, eachTraversal)
+		eachPath, _ := schemaAwareRewriteTraversal(props, mapping, eachTraversal)
+		eachTraversal = eachPath.indexed()
 	} else {
 		eachTraversal = naiveRewriteTraversal(eachTraversal)
 	}
