@@ -1,0 +1,6 @@
+kind: bug-fixes
+body: "Read the `MaxItems: 1` set blocks of a splat's elements with `one()` when converting PCL to HCL"
+time: 2026-10-30T03:30:35.000000+08:00
+custom:
+    Component: converter
+    PR: "791"
