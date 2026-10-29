@@ -12,20 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package putest_test
+package hcltest_test
 
 import (
 	"testing"
 
-	"github.com/pulumi/pulumi-hcl/tests/testutil/putest"
+	"github.com/pulumi/pulumi-hcl/tests/testutil/hcltest"
 	"github.com/pulumi/pulumi-hcl/tests/testutil/tfcompat/providers"
 )
 
 func TestL2NullAliases(t *testing.T) {
 	t.Parallel()
-	putest.RunCase(t, "l2_null_aliases", putest.Case{
+	hcltest.RunCase(t, "l2_null_aliases", hcltest.Case{
 		SkipRunPCL: "TODO[https://github.com/pulumi/pulumi-hcl/issues/711]: HCL -> PCL writes `tolist` as `notImplemented`.",
-		Providers: []putest.Provider{
+		Providers: []hcltest.Provider{
 			{Name: "simple", Factory: providers.SimpleProvider},
 		},
 	})

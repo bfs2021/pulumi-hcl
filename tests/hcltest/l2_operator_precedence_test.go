@@ -12,27 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package putest_test
+package hcltest_test
 
 import (
 	"testing"
 
-	"github.com/pulumi/pulumi-hcl/tests/testutil/putest"
-	"github.com/pulumi/pulumi-hcl/tests/testutil/tfcompat/providers"
+	"github.com/pulumi/pulumi-hcl/tests/testutil/hcltest"
 )
 
-// TestL2IgnoreChangesNestedBlock writes `ignore_changes` into a MaxItems=1
-// block as `settings[0].mode`. The bridge flattens the block to one object,
-// so PCL must name the path `settings.mode`, and HCL must get the [0] back.
-// Stage 1 changes only the ignored attribute, so `mode` stays "a".
-func TestL2IgnoreChangesNestedBlock(t *testing.T) {
+// TestL2OperatorPrecedence covers parentheses that change the value of an
+// expression. PCL keeps no parentheses, so the round trip must write them
+// back where HCL precedence needs them.
+func TestL2OperatorPrecedence(t *testing.T) {
 	t.Parallel()
-	putest.RunCase(t, "l2_ignore_changes_nested_block", putest.Case{
-		Providers: []putest.Provider{
-			{Name: "blocky", Factory: providers.BlockyProvider},
-		},
+	hcltest.RunCase(t, "l2_operator_precedence", hcltest.Case{
 		ExpectedOutputs: map[string]string{
-			"mode": "a",
+			"sum_times":         "9",
+			"minus_minus":       "9",
+			"not_and":           "true",
+			"negate_sum":        "-3",
+			"eq_eq":             "true",
+			"conditional_index": "1",
+			"conditional_cond":  "no",
 		},
 	})
 }

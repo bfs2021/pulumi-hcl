@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package putest is the Pulumi-only half of the tfcompat harness: it runs a
+// Package hcltest is the Pulumi-only half of the tfcompat harness: it runs a
 // `.tf` program from testdata/cases/<name>/ through `pulumi up` against
 // in-process bridged providers (pulexec's attach path), asserting directly on
 // stack outputs, exported Pulumi state, and recorded provider operations. Use
@@ -21,7 +21,7 @@
 // tfcompat because the terraform-provider plugin path diverges. Everything
 // else belongs in the tfcompat harness, where OpenTofu defines the expected
 // behavior.
-package putest
+package hcltest
 
 import (
 	"maps"

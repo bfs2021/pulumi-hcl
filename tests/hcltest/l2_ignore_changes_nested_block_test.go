@@ -12,24 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package putest_test
+package hcltest_test
 
 import (
 	"testing"
 
-	"github.com/pulumi/pulumi-hcl/tests/testutil/putest"
+	"github.com/pulumi/pulumi-hcl/tests/testutil/hcltest"
 	"github.com/pulumi/pulumi-hcl/tests/testutil/tfcompat/providers"
 )
 
-// TestL2MapKeyAttribute writes a map key as an attribute (`tags.foo_bar`) in
-// `ignore_changes` and in a reference. A map key is data, not a property
-// name, so the round trip must keep it as `foo_bar`.
-func TestL2MapKeyAttribute(t *testing.T) {
+// TestL2IgnoreChangesNestedBlock writes `ignore_changes` into a MaxItems=1
+// block as `settings[0].mode`. The bridge flattens the block to one object,
+// so PCL must name the path `settings.mode`, and HCL must get the [0] back.
+// Stage 1 changes only the ignored attribute, so `mode` stays "a".
+func TestL2IgnoreChangesNestedBlock(t *testing.T) {
 	t.Parallel()
-	putest.RunCase(t, "l2_map_key_attribute", putest.Case{
-		Providers: []putest.Provider{
-			{Name: "collections", Factory: providers.CollectionsProvider},
+	hcltest.RunCase(t, "l2_ignore_changes_nested_block", hcltest.Case{
+		Providers: []hcltest.Provider{
+			{Name: "blocky", Factory: providers.BlockyProvider},
 		},
-		ExpectedOutputs: map[string]string{"foo_bar": "x"},
+		ExpectedOutputs: map[string]string{
+			"mode": "a",
+		},
 	})
 }
