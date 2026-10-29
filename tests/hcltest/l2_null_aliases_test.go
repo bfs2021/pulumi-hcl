@@ -24,7 +24,7 @@ import (
 func TestL2NullAliases(t *testing.T) {
 	t.Parallel()
 	hcltest.RunCase(t, "l2_null_aliases", hcltest.Case{
-		SkipRunPCL: "TODO[https://github.com/pulumi/pulumi-hcl/issues/711]: HCL -> PCL writes `tolist` as `notImplemented`.",
+		SkipRunConverted: "TODO[https://github.com/pulumi/pulumi-hcl/issues/711]: HCL -> PCL writes `tolist` as `notImplemented`.",
 		Providers: []hcltest.Provider{
 			{Name: "simple", Factory: providers.SimpleProvider},
 		},

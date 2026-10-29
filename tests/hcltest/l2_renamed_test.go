@@ -181,7 +181,7 @@ func TestL2RenamedMaxItemsOneSplatUnset(t *testing.T) {
 	c := renamedCase(map[string]string{
 		"splat": "[]",
 	})
-	c.SkipRunPCL = "TODO[https://github.com/pulumi/pulumi/issues/25328]: A PCL splat over null fails."
+	c.SkipRunConverted = "TODO[https://github.com/pulumi/pulumi/issues/25328]: A PCL splat over null fails."
 	hcltest.RunCase(t, "l2_renamed_max_items_one_splat_unset", c)
 }
 
